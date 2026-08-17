@@ -1,16 +1,14 @@
-import asyncio
 import json
 import logging
 from typing import Dict, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
-import httpx
 
 from app.schemas import AgentState
 from app.agent import LangGraphAssistant
 from app.config import settings
-from app.tools._client import close_http_client
+from app.tools._client import get_http_client, close_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +29,15 @@ assistant = LangGraphAssistant()
 @app.post("/chat", response_model=Dict[str, Any])
 async def chat(payload: AgentState):
     try:
-        loop = asyncio.get_running_loop()
         state_dict = payload.model_dump()
         config = {"configurable": {"thread_id": payload.user_id or "default_session"}}
-        updated_state = await loop.run_in_executor(
-            None, 
-            lambda: assistant.app.invoke(state_dict, config=config)
-        )
+        updated_state = await assistant.app.ainvoke(state_dict, config=config)
         return updated_state
     except Exception as e:
         logger.error("Execution error in /chat: %s", str(e), exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "AgentExecutionError", "message": str(e)}
+            detail={"error": "AgentExecutionError", "message": "An internal error occurred. Please try again."}
         )
 
 @app.post("/chat/stream")
@@ -64,7 +58,7 @@ async def chat_stream(payload: AgentState):
                     yield f"data: {json.dumps(sse_data)}\n\n"
         except Exception as e:
             logger.error("SSE stream error: %s", str(e), exc_info=True)
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'error': 'Stream interrupted'})}\n\n"
         
         yield "data: [DONE]\n\n"
     
@@ -76,10 +70,11 @@ async def chat_stream(payload: AgentState):
 
 @app.get("/health")
 async def health_check():
+    upstream_ok = False
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{settings.user_api_base_url}/health")
-            upstream_ok = resp.status_code == 200
+        client = await get_http_client()
+        resp = await client.get("/health")
+        upstream_ok = resp.status_code == 200
     except Exception:
         upstream_ok = False
         

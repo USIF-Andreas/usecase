@@ -2,7 +2,7 @@ import json
 import time
 import asyncio
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -13,15 +13,10 @@ from app.tools.subscription import update_subscription, UpdateSubscriptionInput
 
 logger = logging.getLogger(__name__)
 
-def _run_async(coro):
-    """Safely run async coroutine from sync execution context."""
-    try:
-        loop = asyncio.get_running_loop()
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return loop.run_in_executor(pool, lambda: asyncio.run(coro))
-    except RuntimeError:
-        return asyncio.run(coro)
+TOOL_INTENT_KEYWORDS = {
+    "get_profile": ["get_profile", "profile", "user_info", "view plan", "my profile", "account info"],
+    "update_sub": ["update_sub", "upgrade", "change plan", "subscribe", "subscription"],
+}
 
 class LangGraphAssistant:
     def __init__(self):
@@ -55,7 +50,6 @@ class LangGraphAssistant:
         self.app = self.workflow.compile(checkpointer=self.checkpointer)
 
     def _prune_context(self, messages: list[dict], max_turns: int | None = None) -> list[dict]:
-        """Adaptive Context Pruning: preserves first message & recent window, truncates old tool outputs."""
         max_turns = max_turns or settings.max_context_turns
         if len(messages) <= max_turns:
             return messages
@@ -70,19 +64,66 @@ class LangGraphAssistant:
                 pruned.append(msg)
         return pruned
 
-    def call_model(self, state: AgentState) -> Dict[str, Any]:
+    def _extract_requested_plan(self, content: str) -> Optional[PlanName]:
+        content_lower = content.lower()
+        if "enterprise" in content_lower:
+            return PlanName.ENTERPRISE
+        elif "free" in content_lower:
+            return PlanName.FREE
+        elif "pro" in content_lower or "upgrade" in content_lower or "change plan" in content_lower:
+            return PlanName.PRO
+        return None
+
+    def _extract_user_intent(self, messages: list[dict]) -> str:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return msg.get("content", "")
+        return ""
+
+    def _detect_intent_from_message(self, content: str) -> tuple[bool, bool]:
+        content_lower = content.lower()
+        has_profile = any(k in content_lower for k in TOOL_INTENT_KEYWORDS["get_profile"])
+        has_sub = any(k in content_lower for k in TOOL_INTENT_KEYWORDS["update_sub"])
+        return has_profile, has_sub
+
+    async def call_model(self, state: AgentState) -> Dict[str, Any]:
         start = time.perf_counter()
         
         pruned = self._prune_context(state.messages)
         context_token_estimate = sum(len(json.dumps(m)) for m in pruned) // 4
         
         new_step_count = state.step_count + 1
-        estimated_cost = state.total_cost_usd + 0.02
         
-        # Model Tiering: route to FAST model for follow-ups, FULL for initial turn
         model_tier = ModelTier.FAST if new_step_count > 1 else ModelTier.FULL
+        step_cost = 0.005 if model_tier == ModelTier.FAST else 0.02
+        estimated_cost = state.total_cost_usd + step_cost
         
-        response_msg = {"role": "assistant", "content": "Evaluating next action..."}
+        user_intent = self._extract_user_intent(pruned)
+        
+        has_tool_result = False
+        if pruned and pruned[-1].get("role") == "tool":
+            has_tool_result = True
+        
+        if has_tool_result:
+            response_msg = {
+                "role": "assistant",
+                "content": "Task completed. Here is the result."
+            }
+        else:
+            has_profile, has_sub = self._detect_intent_from_message(user_intent)
+            if has_profile and has_sub:
+                intent_hint = "get_profile and update_sub"
+            elif has_profile:
+                intent_hint = "get_profile"
+            elif has_sub:
+                intent_hint = "update_sub"
+            else:
+                intent_hint = "end"
+            response_msg = {
+                "role": "assistant",
+                "content": f"Executing: {intent_hint}"
+            }
+        
         latency_ms = (time.perf_counter() - start) * 1000
         
         telemetry_entry = {
@@ -110,42 +151,58 @@ class LangGraphAssistant:
         if state.step_count >= settings.max_steps or state.total_cost_usd >= settings.cost_limit_usd:
             return "end"
         
-        last_message = state.messages[-1] if state.messages else {}
-        content = last_message.get("content", "")
-
-        has_profile = "get_profile" in content
-        has_sub = "update_sub" in content
-        
-        if has_profile and has_sub:
-            return "parallel"
-        elif has_profile:
-            return "get_profile"
-        elif has_sub:
-            return "update_sub"
+        for msg in reversed(state.messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                has_profile, has_sub = self._detect_intent_from_message(content)
+                
+                if has_profile and has_sub:
+                    return "parallel"
+                elif has_profile:
+                    return "get_profile"
+                elif has_sub:
+                    return "update_sub"
+                else:
+                    return "end"
         
         return "end"
 
-    def run_get_user_profile(self, state: AgentState) -> Dict[str, Any]:
+    async def run_get_user_profile(self, state: AgentState) -> Dict[str, Any]:
         if not state.user_id:
-            return {"errors": state.errors + [{"error": "Missing user_id"}]}
+            return {"errors": state.errors + [{"error": "Missing user_id", "code": "INVALID_STATE"}]}
             
         try:
             inp = GetUserProfileInput(user_id=state.user_id)
-            res = asyncio.run(get_user_profile(inp))
+            res = await get_user_profile(inp)
             if res.get("status") == "error":
                 return {"errors": state.errors + [res]}
                 
             return {"messages": state.messages + [{"role": "tool", "content": json.dumps(res)}]}
         except Exception as e:
-            return {"errors": state.errors + [{"error": "validation_failure", "detail": str(e)}]}
+            return {"errors": state.errors + [{"error": "execution_failure", "detail": str(e)}]}
 
-    def run_update_subscription(self, state: AgentState) -> Dict[str, Any]:
+    async def run_update_subscription(self, state: AgentState) -> Dict[str, Any]:
         if not state.user_id:
-            return {"errors": state.errors + [{"error": "Missing user_id"}]}
+            return {"errors": state.errors + [{"error": "Missing user_id", "code": "INVALID_STATE"}]}
 
         try:
-            inp = UpdateSubscriptionInput(user_id=state.user_id, plan_name=PlanName.PRO)
-            res = asyncio.run(update_subscription(inp))
+            last_user_msg = next((m.get("content", "") for m in reversed(state.messages) if m.get("role") == "user"), "")
+            target_plan = self._extract_requested_plan(last_user_msg)
+            
+            if target_plan is None:
+                return {
+                    "errors": state.errors + [{
+                        "error": "no_plan_specified",
+                        "code": "AMBIGUOUS_REQUEST",
+                        "error_type": "MISSING_PLAN",
+                        "message": "No target plan specified in the request. Please specify 'free', 'pro', or 'enterprise'.",
+                        "retryable": False,
+                        "suggestion": "Ask the user which plan they want to switch to."
+                    }]
+                }
+            
+            inp = UpdateSubscriptionInput(user_id=state.user_id, plan_name=target_plan)
+            res = await update_subscription(inp)
             
             if res.get("status") == "error":
                 return {"errors": state.errors + [res]}
@@ -154,27 +211,28 @@ class LangGraphAssistant:
             
             return {
                 "messages": state.messages + [{"role": "tool", "content": json.dumps(res)}],
-                "current_plan": PlanName.PRO
+                "current_plan": target_plan
             }
         except Exception as e:
-            return {"errors": state.errors + [{"error": "validation_failure", "detail": str(e)}]}
+            return {"errors": state.errors + [{"error": "execution_failure", "detail": str(e)}]}
 
-    def run_parallel_tools(self, state: AgentState) -> Dict[str, Any]:
-        """Executes get_user_profile and update_subscription in parallel via asyncio.gather."""
+    async def run_parallel_tools(self, state: AgentState) -> Dict[str, Any]:
         if not state.user_id:
-            return {"errors": state.errors + [{"error": "Missing user_id"}]}
+            return {"errors": state.errors + [{"error": "Missing user_id", "code": "INVALID_STATE"}]}
 
-        async def _run_both():
-            profile_inp = GetUserProfileInput(user_id=state.user_id)
-            sub_inp = UpdateSubscriptionInput(user_id=state.user_id, plan_name=PlanName.PRO)
-            return await asyncio.gather(
+        last_user_msg = next((m.get("content", "") for m in reversed(state.messages) if m.get("role") == "user"), "")
+        target_plan = self._extract_requested_plan(last_user_msg)
+
+        profile_inp = GetUserProfileInput(user_id=state.user_id)
+        sub_inp = UpdateSubscriptionInput(user_id=state.user_id, plan_name=target_plan or PlanName.PRO)
+
+        try:
+            results = await asyncio.gather(
                 get_user_profile(profile_inp),
                 update_subscription(sub_inp),
                 return_exceptions=True
             )
-
-        try:
-            results = asyncio.run(_run_both())
+            
             new_messages, new_errors = [], []
             new_plan = state.current_plan
             
@@ -186,7 +244,7 @@ class LangGraphAssistant:
                 elif isinstance(res, dict):
                     new_messages.append({"role": "tool", "content": json.dumps(res)})
                     if res.get("idempotency_key"):
-                        new_plan = PlanName.PRO
+                        new_plan = target_plan or PlanName.PRO
                         cache_invalidate(state.user_id)
             
             result = {"messages": state.messages + new_messages}
